@@ -16,7 +16,7 @@
     "jsx": "preserve",
     "noEmit": true,
     "types": ["vite/client"],
-    "baseUrl": ".",
+    // 不写 baseUrl：TS 5.9+ 已弃用它（TS 7 将移除），paths 会相对本文件解析
     "paths": {
       "@/*": ["./src/*"]
     }
