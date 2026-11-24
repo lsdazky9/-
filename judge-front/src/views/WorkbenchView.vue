@@ -24,6 +24,7 @@ import {
   LANGUAGE_MONACO,
   LANGUAGE_OPTIONS,
   PHASE_LABEL,
+  SOURCE_CODE_LIMIT_BYTES,
   SUBMISSION_STATUS_LABEL,
   type ExamDetail,
   type Language,
@@ -112,11 +113,101 @@ const languageOptions = computed(() =>
   LANGUAGE_OPTIONS.filter((option) => availableLanguages.value.includes(option.value))
 )
 
-const currentLanguageNote = computed(
-  () => LANGUAGE_OPTIONS.find((option) => option.value === language.value)?.note ?? ''
+const editorLanguage = computed(() => LANGUAGE_MONACO[language.value])
+
+/* ---------------------- 题目列表侧栏（题目总览） ---------------------- */
+
+type CellStatus = 'AC' | 'TRIED' | 'TODO'
+
+interface SetCell {
+  id: string
+  title: string
+  index: number
+  status: CellStatus
+}
+
+const setCells = ref<SetCell[]>([])
+const sidebarReady = ref(false)
+
+const answeredCount = computed(() => setCells.value.filter((cell) => cell.status !== 'TODO').length)
+const currentIndex = computed(() => setCells.value.findIndex((cell) => cell.id === props.problemId))
+const prevCell = computed(() =>
+  currentIndex.value > 0 ? setCells.value[currentIndex.value - 1] : null
+)
+const nextCell = computed(() =>
+  currentIndex.value >= 0 && currentIndex.value < setCells.value.length - 1
+    ? setCells.value[currentIndex.value + 1]
+    : null
 )
 
-const editorLanguage = computed(() => LANGUAGE_MONACO[language.value])
+const flipped = ref(false)
+const isFullscreen = ref(false)
+
+async function loadSidebar(): Promise<void> {
+  try {
+    if (isExam.value && exam.value) {
+      // 考试只返回阶段与判定，这里用"是否提交过"表示作答状态
+      setCells.value = exam.value.problems.map((item) => ({
+        id: item.problemId,
+        title: item.title,
+        index: item.ordinal,
+        status: item.submissionCount > 0 ? 'TRIED' : 'TODO'
+      }))
+    } else {
+      const [problems, submissions] = await Promise.all([
+        problemApi.list({ page: 1, size: 100 }),
+        submissionApi.list({ page: 1, size: 100, context: 'PRACTICE' })
+      ])
+      const best = new Map<string, CellStatus>()
+      for (const item of submissions.items) {
+        if (!item.problemId) continue
+        if (item.verdict === 'AC') best.set(item.problemId, 'AC')
+        else if (!best.has(item.problemId)) best.set(item.problemId, 'TRIED')
+      }
+      setCells.value = problems.items.map((row, index) => ({
+        id: row.id,
+        title: row.title,
+        index: index + 1,
+        status: best.get(row.id) ?? 'TODO'
+      }))
+    }
+  } catch {
+    setCells.value = []
+  } finally {
+    sidebarReady.value = true
+  }
+}
+
+/** 出结果后同步网格状态，避免必须刷新页面才变绿。 */
+function markSidebar(problemId: string, verdict: string | null): void {
+  const cell = setCells.value.find((item) => item.id === problemId)
+  if (!cell) return
+  if (verdict === 'AC') cell.status = 'AC'
+  else if (cell.status === 'TODO' && verdict) cell.status = 'TRIED'
+}
+
+function openCell(cell: SetCell): void {
+  if (cell.id === props.problemId) return
+  if (isExam.value && props.examId) {
+    void router.push({ name: 'exam-workbench', params: { id: props.examId, problemId: cell.id } })
+  } else {
+    void router.push({ name: 'problem-workbench', params: { id: cell.id } })
+  }
+}
+
+async function toggleFullscreen(): Promise<void> {
+  try {
+    if (!document.fullscreenElement) {
+      await shell.value?.requestFullscreen()
+      isFullscreen.value = true
+    } else {
+      await document.exitFullscreen()
+      isFullscreen.value = false
+    }
+  } catch {
+    toast.warn('当前浏览器不允许进入全屏')
+  }
+}
 
 const submission = ref<SubmissionDetail | null>(null)
 const restoring = ref(false)
@@ -176,6 +267,7 @@ const poller = usePolling<SubmissionDetail>({
     if (!id) throw new Error('no submission')
     const detail = await submissionApi.detail(id)
     submission.value = detail
+    if (isTerminal(detail)) markSidebar(detail.problemId, detail.verdict)
     return detail
   },
   shouldContinue: (detail) => !isTerminal(detail),
@@ -229,6 +321,12 @@ const acPeak = computed(() => {
   }
 })
 
+/** 题头已经有"题目描述"页签，正文里重复的一级标题去掉，避免同屏出现两次。 */
+const statementMarkdown = computed(() => {
+  const source = problem.value?.statementMarkdown ?? ''
+  return source.replace(/^\s*#{2,4}\s*题目描述\s*\r?\n+/, '')
+})
+
 async function loadAll() {
   loading.value = true
   loadError.value = ''
@@ -245,13 +343,28 @@ async function loadAll() {
       problem.value = await problemApi.detail(props.problemId)
     }
     prepareEditor()
-    await restoreLastSubmission()
+    await Promise.all([loadSidebar(), restoreLastSubmission()])
   } catch (e) {
     loadError.value = describeError(e)
   } finally {
     loading.value = false
   }
 }
+
+/** 从题目列表点另一题时组件会被复用，需要重置状态并重新加载。 */
+watch(
+  () => [props.problemId, props.examId],
+  async () => {
+    poller.stop()
+    submission.value = null
+    submitError.value = ''
+    submitNotice.value = ''
+    idempotencyKey.value = null
+    showDraftBanner.value = false
+    draftFrom.value = null
+    await loadAll()
+  }
+)
 
 function prepareEditor() {
   const user = auth.user
@@ -455,45 +568,159 @@ onMounted(loadAll)
 
 <template>
   <div ref="shell" class="wb">
-    <div class="wb__bar">
-      <button
-        class="btn btn--ghost btn--sm"
-        type="button"
-        @click="router.push(isExam ? { name: 'exam-entry', params: { id: examId } } : { name: 'problems' })"
-      >
-        ← {{ isExam ? '返回考试' : '返回题库' }}
+    <!-- 左侧图标导航（对应参考界面最左侧一列） -->
+    <nav class="rail" aria-label="题目导航">
+      <RouterLink class="rail__item" :to="isExam ? { name: 'exam-entry', params: { id: examId } } : '/problems'">
+        <span class="rail__icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+            <rect x="3.5" y="3.5" width="7" height="7" rx="1.5" />
+            <rect x="13.5" y="3.5" width="7" height="7" rx="1.5" />
+            <rect x="3.5" y="13.5" width="7" height="7" rx="1.5" />
+            <rect x="13.5" y="13.5" width="7" height="7" rx="1.5" />
+          </svg>
+        </span>
+        <span class="rail__label">概览</span>
+      </RouterLink>
+      <button class="rail__item rail__item--active" type="button" aria-current="page">
+        <span class="rail__icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+            <rect x="4" y="3.5" width="16" height="17" rx="2" />
+            <path d="M8 8h8M8 12h8M8 16h5" stroke-linecap="round" />
+          </svg>
+        </span>
+        <span class="rail__label">题目列表</span>
       </button>
+      <RouterLink class="rail__item" to="/submissions">
+        <span class="rail__icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+            <path d="M4 6h16M4 12h16M4 18h10" stroke-linecap="round" />
+            <circle cx="19" cy="18" r="2" />
+          </svg>
+        </span>
+        <span class="rail__label">提交列表</span>
+      </RouterLink>
+      <span class="rail__item rail__item--disabled" title="本期不提供排名（BR-12）">
+        <span class="rail__icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+            <path d="M5 20V10M12 20V4M19 20v-7" stroke-linecap="round" />
+          </svg>
+        </span>
+        <span class="rail__label">排名</span>
+      </span>
+    </nav>
 
-      <div class="wb__title">
-        <span class="mono small faint">#{{ problemId }}</span>
-        <strong>{{ problem?.title ?? '加载中…' }}</strong>
-        <span v-if="isExam" class="badge badge--brand">考试作答</span>
-        <span v-else class="badge badge--neutral">练习</span>
+    <!-- 题目总览 + 题号网格（对应参考界面第二列） -->
+    <aside class="catalog" aria-label="题目列表">
+      <div class="catalog__head">
+        <span>题目总览</span>
+        <span class="catalog__head-right">作答 / 题数</span>
       </div>
 
-      <span class="grow" />
-
-      <div v-if="isExam" class="wb__countdown" :class="{ 'wb__countdown--danger': examEnded }">
-        <span class="small muted">剩余</span>
-        <strong class="mono">{{ examRemainingText }}</strong>
-      </div>
-
-      <div class="wb__bar-actions">
-        <button
-          class="btn btn--primary"
-          type="button"
-          :disabled="!canSubmit"
-          :title="submitBlockedReason"
-          @click="onSubmit"
-        >
-          <span v-if="submitting" class="spinner" aria-hidden="true" />
-          {{ submitting ? '提交中…' : '提交评测' }}
+      <div class="catalog__cats">
+        <button class="catalog__cat catalog__cat--active" type="button">
+          <span class="catalog__cat-icon" aria-hidden="true">≤</span>
+          <span class="catalog__cat-label">{{ isExam ? '考试题' : '编程题' }}</span>
+          <span class="catalog__cat-count">{{ answeredCount }} / {{ setCells.length }}</span>
         </button>
-        <span class="wb__kbd small muted"><kbd class="kbd">Ctrl</kbd>+<kbd class="kbd">↵</kbd></span>
       </div>
-    </div>
 
-    <div class="wb__body">
+      <div class="catalog__section">
+        <span class="catalog__section-title">{{ isExam ? '本场考试' : '编程题' }}</span>
+        <details class="legend">
+          <summary class="legend__summary">ⓘ 图例</summary>
+          <div class="legend__body">
+            <span><i class="cell cell--ac" /> 已通过</span>
+            <span><i class="cell cell--tried" /> 尝试过</span>
+            <span><i class="cell" /> 未作答</span>
+            <span><i class="cell cell--current" /> 当前题</span>
+          </div>
+        </details>
+      </div>
+
+      <div v-if="!sidebarReady" class="catalog__grid">
+        <span v-for="n in 12" :key="n" class="skeleton" style="height: 34px" />
+      </div>
+
+      <div v-else-if="setCells.length === 0" class="catalog__empty small muted">
+        暂无题目
+      </div>
+
+      <div v-else class="catalog__grid">
+        <button
+          v-for="cell in setCells"
+          :key="cell.id"
+          class="cell"
+          :class="[`cell--${cell.status.toLowerCase()}`, { 'cell--current': cell.id === problemId }]"
+          type="button"
+          :title="`${cell.title} · ${cell.status === 'AC' ? '已通过' : cell.status === 'TRIED' ? '尝试过' : '未作答'}`"
+          @click="openCell(cell)"
+        >
+          {{ cell.index }}
+        </button>
+      </div>
+
+      <div class="catalog__foot small muted">
+        当前 1–{{ setCells.length }} 项，共 {{ setCells.length }} 项
+      </div>
+    </aside>
+
+    <div class="wb__main">
+      <div class="wb__bar">
+        <button
+          class="btn btn--ghost btn--sm"
+          type="button"
+          @click="router.push(isExam ? { name: 'exam-entry', params: { id: examId } } : { name: 'problems' })"
+        >
+          ‹ {{ isExam ? '返回考试' : '返回题库' }}
+        </button>
+
+        <div class="wb__title">
+          <span class="mono small faint">#{{ problemId }}</span>
+          <strong>{{ problem?.title ?? '加载中…' }}</strong>
+          <span v-if="isExam" class="badge badge--brand">考试作答</span>
+          <span v-else class="badge badge--neutral">练习</span>
+        </div>
+
+        <span class="grow" />
+
+        <div v-if="isExam" class="wb__countdown" :class="{ 'wb__countdown--danger': examEnded }">
+          <span class="small muted">剩余</span>
+          <strong class="mono">{{ examRemainingText }}</strong>
+        </div>
+
+        <div class="wb__bar-actions">
+          <button
+            class="btn btn--sm"
+            type="button"
+            :disabled="!prevCell"
+            :title="prevCell ? prevCell.title : '已经是第一题'"
+            @click="prevCell && openCell(prevCell)"
+          >
+            ‹ 上一题
+          </button>
+          <button
+            class="btn btn--sm"
+            type="button"
+            :disabled="!nextCell"
+            :title="nextCell ? nextCell.title : '已经是最后一题'"
+            @click="nextCell && openCell(nextCell)"
+          >
+            下一题 ›
+          </button>
+          <button
+            class="btn btn--primary"
+            type="button"
+            :disabled="!canSubmit"
+            :title="submitBlockedReason"
+            @click="onSubmit"
+          >
+            <span v-if="submitting" class="spinner" aria-hidden="true" />
+            {{ submitting ? '提交中…' : '提交本题作答' }}
+          </button>
+        </div>
+      </div>
+
+      <div class="wb__body" :class="{ 'wb__body--flipped': flipped }">
       <section class="wb__pane wb__pane--statement">
         <div v-if="loading" class="wb__skeleton">
           <span class="skeleton" style="width: 42%; height: 18px" />
@@ -515,23 +742,35 @@ onMounted(loadAll)
         </div>
 
         <template v-else-if="problem">
-          <div class="wb__pane-head">
-            <h2>{{ problem.title }}</h2>
-            <div class="row gap-4">
-              <span class="chip">v{{ problem.versionNo }}</span>
-              <span class="chip">{{ problem.checkerType }}</span>
+          <!-- 题头：与参考界面一致——"题目描述"页签 + 标题/分数 + 作者/单位 -->
+          <div class="stmt-tab">题目描述</div>
+
+          <div class="stmt-head">
+            <div class="stmt-title">
+              <h2>{{ problem.title }}</h2>
+              <span v-if="problem.fullScore !== null" class="score-pill">
+                分数 {{ problem.fullScore }}
+              </span>
+            </div>
+
+            <div class="stmt-meta">
+              <div class="stmt-meta__actions">
+                <button class="link-btn" type="button" @click="toggleFullscreen">
+                  {{ isFullscreen ? '退出全屏' : '全屏浏览' }}
+                </button>
+                <button class="link-btn" type="button" @click="flipped = !flipped">
+                  {{ flipped ? '恢复布局' : '切换布局' }}
+                </button>
+              </div>
+              <div class="stmt-meta__author">
+                <span>作者 {{ problem.ownerName }}</span>
+                <span>单位 {{ problem.organization }}</span>
+              </div>
             </div>
           </div>
 
-          <div class="wb__limits">
-            <span class="chip">CPU {{ formatMs(problem.limits.timeLimitMs) }}</span>
-            <span class="chip">Wall {{ formatMs(problem.limits.wallLimitMs) }}</span>
-            <span class="chip">内存 {{ formatMemory(problem.limits.memoryLimitKb) }}</span>
-            <span class="chip">输出 {{ formatBytes(problem.limits.outputLimitBytes) }}</span>
-          </div>
-
           <div class="wb__statement">
-            <MarkdownView :source="problem.statementMarkdown" />
+            <MarkdownView :source="statementMarkdown" />
           </div>
 
           <div v-if="problem.samples.length" class="wb__samples">
@@ -563,6 +802,22 @@ onMounted(loadAll)
               总成绩需等待教师发布。
             </span>
           </div>
+
+          <!-- 题面末尾的限制汇总（灰色底，与参考界面一致） -->
+          <div class="limit-card">
+            <div class="limit-card__row">
+              <span>代码长度限制</span>
+              <strong>{{ formatBytes(SOURCE_CODE_LIMIT_BYTES) }}</strong>
+            </div>
+            <div class="limit-card__row">
+              <span>时间限制</span>
+              <strong>{{ problem.limits.timeLimitMs }} ms</strong>
+            </div>
+            <div class="limit-card__row">
+              <span>内存限制</span>
+              <strong>{{ Math.round(problem.limits.memoryLimitKb / 1024) }} MB</strong>
+            </div>
+          </div>
         </template>
       </section>
 
@@ -579,7 +834,6 @@ onMounted(loadAll)
                 {{ option.label }}
               </option>
             </select>
-            <span class="muted small">{{ currentLanguageNote }}</span>
           </div>
           <div class="row gap-8">
             <button v-if="!sourceCode.trim()" class="btn btn--sm" type="button" @click="insertTemplate">
@@ -820,16 +1074,281 @@ onMounted(loadAll)
         </div>
       </div>
     </section>
+    </div>
   </div>
 </template>
 
 <style scoped>
 .wb {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   flex: 1 1 auto;
   min-height: 0;
   background: var(--bg);
+}
+
+/* ---------------------- 左侧图标导航 ---------------------- */
+
+.rail {
+  flex: none;
+  width: 78px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 8px;
+}
+
+.rail__item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 9px 4px;
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-sm);
+  color: var(--ink-muted);
+  font-size: 11.5px;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.rail__item:hover {
+  background: var(--bg-subtle);
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.rail__item--active {
+  background: var(--brand-soft);
+  color: var(--brand-strong);
+  font-weight: 650;
+}
+
+.rail__item--disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.rail__icon {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+}
+
+.rail__icon svg {
+  width: 18px;
+  height: 18px;
+  display: block;
+}
+
+/* ---------------------- 题目总览 ---------------------- */
+
+.catalog {
+  flex: none;
+  width: 236px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.catalog__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 14px;
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--ink-soft);
+  border-bottom: 1px solid var(--border);
+}
+
+.catalog__head-right {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink-muted);
+}
+
+.catalog__cats {
+  padding: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.catalog__cat {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.catalog__cat--active {
+  background: var(--brand-soft);
+  border-color: var(--brand-line);
+  color: var(--brand-strong);
+  font-weight: 650;
+}
+
+.catalog__cat-icon {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--brand);
+}
+
+.catalog__cat-label {
+  flex: 1 1 auto;
+  text-align: left;
+}
+
+.catalog__cat-count {
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+
+.catalog__section {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 12px 14px 8px;
+}
+
+.catalog__section-title {
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--ink-soft);
+}
+
+.legend {
+  position: relative;
+}
+
+.legend__summary {
+  list-style: none;
+  font-size: 11.5px;
+  color: var(--ink-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.legend__summary::-webkit-details-marker {
+  display: none;
+}
+
+.legend__body {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 10;
+  width: 156px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  font-size: 11.5px;
+  color: var(--ink-soft);
+}
+
+.legend__body span {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.catalog__grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  padding: 4px 14px 12px;
+  overflow: auto;
+  min-height: 0;
+  flex: 1 1 auto;
+  align-content: start;
+}
+
+.catalog__empty {
+  padding: 16px 14px;
+}
+
+.catalog__foot {
+  flex: none;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-sunken);
+}
+
+.cell {
+  display: grid;
+  place-items: center;
+  height: 34px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--ink-muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.cell:hover {
+  border-color: var(--brand);
+  color: var(--brand-strong);
+}
+
+.cell--ac {
+  border-color: #9fd9c0;
+  background: var(--ac-soft);
+  color: var(--ac);
+  font-weight: 700;
+}
+
+.cell--tried {
+  border-color: #f0c98a;
+  background: var(--ce-soft);
+  color: #8a5a10;
+}
+
+.cell--current {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 2px var(--brand-soft);
+  color: var(--brand-strong);
+  font-weight: 700;
+}
+
+.legend .cell {
+  height: 14px;
+  border-radius: 3px;
+  pointer-events: none;
+  display: inline-block;
+  width: 14px;
+}
+
+/* ---------------------- 中间内容区 ---------------------- */
+
+.wb__main {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .wb__bar {
@@ -913,25 +1432,93 @@ onMounted(loadAll)
   overflow: auto;
 }
 
-.wb__pane-head {
+.wb__body--flipped .wb__pane--statement {
+  order: 2;
+}
+
+.wb__body--flipped .wb__pane--code {
+  order: 1;
+}
+
+/* ---------------------- 题头（题目描述 / 标题 / 作者单位） ---------------------- */
+
+.stmt-tab {
+  flex: none;
+  padding: 9px 20px;
+  background: var(--surface-sunken);
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--ink-soft);
+}
+
+.stmt-head {
+  flex: none;
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.stmt-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.stmt-title h2 {
+  font-size: 19px;
+  font-weight: 680;
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+}
+
+.score-pill {
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  color: var(--ink-muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.stmt-meta {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding: 14px 20px 10px;
+  gap: 12px;
   flex-wrap: wrap;
 }
 
-.wb__pane-head h2 {
-  font-size: 16px;
-}
-
-.wb__limits {
+.stmt-meta__actions {
   display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-  padding: 0 20px 12px;
-  border-bottom: 1px solid var(--border);
+  gap: 14px;
+}
+
+.link-btn {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--ink-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.link-btn:hover {
+  color: var(--brand);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.stmt-meta__author {
+  display: flex;
+  gap: 14px;
+  font-size: 12px;
+  color: var(--ink-muted);
 }
 
 .wb__statement {
@@ -951,6 +1538,34 @@ onMounted(loadAll)
 
 .wb__samples {
   padding: 4px 20px 20px;
+}
+
+/* 题面末尾的限制汇总 */
+.limit-card {
+  margin: 8px 20px 24px;
+  padding: 14px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: var(--surface-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.limit-card__row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  color: var(--ink-muted);
+}
+
+.limit-card__row strong {
+  font-weight: 600;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .wb__section-title {
@@ -1313,7 +1928,25 @@ onMounted(loadAll)
   word-break: break-word;
 }
 
+@media (max-width: 1440px) {
+  .catalog {
+    width: 208px;
+  }
+  .catalog__grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 1240px) {
+  .catalog {
+    display: none;
+  }
+}
+
 @media (max-width: 1024px) {
+  .rail {
+    display: none;
+  }
   .wb__body {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto auto;

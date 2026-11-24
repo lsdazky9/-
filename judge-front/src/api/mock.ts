@@ -1189,7 +1189,10 @@ function route(
       language: 'CPP17',
       languages: ['CPP17', 'C11', 'PY3', 'JAVA17'],
       feedbackPolicy: 'FULL',
-      hasVisibleCases: version.cases.some((x) => x.isSample)
+      hasVisibleCases: version.cases.some((x) => x.isSample),
+      ownerName: users.find((u) => u.id === problem.ownerId)?.displayName ?? '教师',
+      organization: '软件工程学院',
+      fullScore: null
     }
     return detail
   }
@@ -1312,6 +1315,7 @@ function route(
         const detail = submissionDetail(s, user)
         return {
           id: s.id,
+          problemId: s.problemId,
           problemTitle: detail.problemTitle,
           examTitle: detail.examTitle,
           contextType: s.contextType,
@@ -1425,7 +1429,10 @@ function route(
       language: exam.allowedLanguages[0] ?? 'CPP17',
       languages: exam.allowedLanguages,
       feedbackPolicy: 'VERDICT_ONLY',
-      hasVisibleCases: true
+      hasVisibleCases: true,
+      ownerName: users.find((u) => u.id === exam.ownerId)?.displayName ?? '教师',
+      organization: '软件工程学院',
+      fullScore: item.fullScore
     }
     return detail
   }
